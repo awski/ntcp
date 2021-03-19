@@ -8,13 +8,25 @@ pub struct TCB {
     state: State,
     send: SendSequence,
     recv: RecvSequence,
+    ip: etherparse::Ipv4Header,
+    tcp: etherparse::TcpHeader,
 }
 
 pub enum State {
     Closed,
     Listen,
-    SynRecv
+    SynRecv,
     Estab,
+}
+
+impl State {
+    fn is_synchronized(&self) -> bool {
+        match *self {
+            State::SynRecv => false,
+            State::Estab => true,
+            _ => unimplemented!(),
+        }
+    }
 }
 
 struct SendSequence {
@@ -48,13 +60,14 @@ impl TCB {
 
         let mut buf = [0u8; MTU_SIZE];
         let iss = 0;
+        let wnd = 1024;
         let mut tcb = TCB {
             state: State::SynRecv,
             send: SendSequence {
                 iss,
                 una: iss,
                 next: iss + 1,
-                window: 10,
+                window: wnd,
                 up: false,
                 wl1: 0,
                 wl2: 0,
@@ -65,53 +78,30 @@ impl TCB {
                 window: tcp_hdr.window_size(),
                 up: false,
             },
+            tcp: etherparse::TcpHeader::new(tcp_hdr.destination_port(), tcp_hdr.source_port(), iss, wnd),
+            ip: etherparse::Ipv4Header::new(
+                0,
+                64,
+                etherparse::IpTrafficClass::Tcp,
+                [
+                    ip_hdr.destination()[0],
+                    ip_hdr.destination()[1],
+                    ip_hdr.destination()[2],
+                    ip_hdr.destination()[3],
+                ],
+                [
+                    ip_hdr.source()[0],
+                    ip_hdr.source()[1],
+                    ip_hdr.source()[2],
+                    ip_hdr.source()[3],
+                ],
+            ),
         };
 
-        let mut syn_ack = etherparse::TcpHeader::new(
-            tcp_hdr.destination_port(),
-            tcp_hdr.source_port(),
-            tcb.send.iss,
-            tcb.send.window,
-        );
-
-        syn_ack.acknowledgment_number = tcb.recv.next;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        
-        let new_ip_hdr = etherparse::Ipv4Header::new(
-            syn_ack.header_len(),
-            IP_HDR_TIMEOUT,
-            etherparse::IpTrafficClass::Tcp,
-            [
-                ip_hdr.destination()[0],
-                ip_hdr.destination()[1],
-                ip_hdr.destination()[2],
-                ip_hdr.destination()[3],
-            ],
-            [
-                ip_hdr.source()[0],
-                ip_hdr.source()[1],
-                ip_hdr.source()[2],
-                ip_hdr.source()[3],
-            ],
-        );
-        
-        let copy_buf = {
-            let mut copy_buf = &mut buf[..];
-            new_ip_hdr.write(&mut copy_buf);
-            syn_ack.write(&mut copy_buf);
-            copy_buf.len()
-        };
-
-        iface.send(&buf[..copy_buf])?;
+        tcb.tcp.syn = true;
+        tcb.tcp.ack = true;
+        tcb.send(iface, &[])?;
         Ok(Some(tcb))
-        // eprintln!("ntcp: {src}:{srcp} -> {dest}:{destp}, pay_l:[{payl}], proto:[0x{prt:x}]",
-        //     src  = ip_hdr.source_addr(),
-        //     srcp = tcp_hdr.source_port(),
-        //     dest = ip_hdr.destination_addr(),
-        //     destp = tcp_hdr.destination_port(),
-        //     payl = tcp_hdr.slice().len(),
-        //     prt  = ip_hdr.protocol());
     }
 
     pub fn on_packet<'a>(
@@ -124,6 +114,9 @@ impl TCB {
 
         let ack_num = tcp_hdr.acknowledgment_number();
         if !is_boundary_valid(self.send.una, ack_num, self.send.next.wrapping_add(1)) {
+            if !self.state.is_synchronized() {
+                self.send_reset(iface);
+            }
             return Ok(());
         }
 
@@ -157,7 +150,8 @@ impl TCB {
 
         match self.state {
             State::SynRecv => {
-                unimplemented!();
+                self.state = State::Estab;
+                Ok(())
             },
             State::Estab => {
                 unimplemented!();
@@ -167,23 +161,59 @@ impl TCB {
             }
         }
     }
+
+    fn send(
+        &mut self,
+        iface: &mut tun_tap::Iface,
+        payl: &[u8]) -> io::Result<(usize)>
+    {
+        let mut buf = [0u8; MTU_SIZE];
+
+        self.tcp.sequence_number = self.send.next;
+        self.tcp.acknowledgment_number = self.recv.next;
+
+        let sz = std::cmp::min(
+            buf.len(),
+            self.tcp.header_len() as usize + self.ip.header_len() as usize + payl.len()
+        );
+        self.ip.set_payload_len(sz);
+
+        let mut copy_buf = &mut buf[..];
+        self.ip.write(&mut copy_buf);
+        self.tcp.write(&mut copy_buf);
+        let payl_bytes = copy_buf.write(payl)?;
+        let copy_buf = copy_buf.len();
+        self.send.next.wrapping_add(payl_bytes as u32);
+
+        if self.tcp.syn {
+            self.send.next.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+        if self.tcp.fin {
+            self.send.next.wrapping_add(1);
+            self.tcp.fin = false;
+        }
+
+        iface.send(&buf[..buf.len() - copy_buf])?;
+        Ok(payl_bytes)
+    }
+
+    fn send_reset(
+        &mut self,
+        iface: &mut tun_tap::Iface) -> io::Result<()>
+    {
+        self.tcp.rst = true;
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.send(iface, &[])?;
+        Ok(())
+    }
+}
+
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    lhs.wrapping_sub(rhs) > (1 << 31)
 }
 
 fn is_boundary_valid(start: u32, x: u32, end: u32) -> bool {
-    use std::cmp::Ordering;
-    match start.cmp(x) {
-        Ordering::Equal => return false,
-        Ordering::Less => {
-            if end >= start && end <= x {
-                return false;
-            }
-        }
-        Ordering::Greater => {
-            if end < start && end > x {
-            } else {
-                return false;
-            }
-        }
-    }
-    true
+    wrapping_lt(start, x) && wrapping_lt(x, end)
 }
