@@ -1,4 +1,4 @@
-use std::io::prelude::*;
+use std::{cmp::Ordering, io::prelude::*, unimplemented};
 use std::io;
 
 const MTU_SIZE: usize = 1500;
@@ -14,7 +14,7 @@ pub enum State {
     Closed,
     Listen,
     SynRecv
-    //Estab,
+    Estab,
 }
 
 struct SendSequence {
@@ -121,6 +121,69 @@ impl TCB {
         tcp_hdr: etherparse::TcpHeaderSlice<'a>,
         data: &'a[u8]
     ) -> io::Result<()> {
-        std::unimplemented!();
+
+        let ack_num = tcp_hdr.acknowledgment_number();
+        if !is_boundary_valid(self.send.una, ack_num, self.send.next.wrapping_add(1)) {
+            return Ok(());
+        }
+
+        let seq_num = tcp_hdr.sequence_number();
+        let mut seq_len = data.len() as u32;
+
+        if tcp_hdr.fin() {
+            seq_len += 1;
+        }
+        if tcp_hdr.syn() {
+            seq_len += 1;
+        }
+        let wend = self.recv.next.wrapping_add(self.recv.window as u32);
+        if seq_len == 0 {
+            if self.recv.window == 0 {
+                if seq_num != self.recv.next {
+                    return Ok(())
+                }
+            } else if !is_boundary_valid(self.recv.next.wrapping_sub(1), seq_num, wend) {
+                return Ok(())
+            }
+        } else {
+            if self.recv.window == 0 {
+                return Ok(())
+            } else if !is_boundary_valid(self.recv.next.wrapping_sub(1), seq_num, wend) &&
+                      !is_boundary_valid(self.recv.next.wrapping_sub(1), seq_num + seq_len - 1, wend) {
+                return Ok(())
+            }
+        }
+
+
+        match self.state {
+            State::SynRecv => {
+                unimplemented!();
+            },
+            State::Estab => {
+                unimplemented!();
+            },
+            _ => {
+                unimplemented!();
+            }
+        }
     }
+}
+
+fn is_boundary_valid(start: u32, x: u32, end: u32) -> bool {
+    use std::cmp::Ordering;
+    match start.cmp(x) {
+        Ordering::Equal => return false,
+        Ordering::Less => {
+            if end >= start && end <= x {
+                return false;
+            }
+        }
+        Ordering::Greater => {
+            if end < start && end > x {
+            } else {
+                return false;
+            }
+        }
+    }
+    true
 }
