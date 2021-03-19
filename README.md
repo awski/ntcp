@@ -1,2 +1,2 @@
 # ntcp
-TCP implementation (in-development)
+TCP implementation from scratch (in-development)

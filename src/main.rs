@@ -7,8 +7,8 @@ struct Connection {
 }
 
 fn main() -> std::io::Result<()> {
-    let interface = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
-    let mut connections: std::collections::HashMap<Connection, ntcp::TcpState> = Default::default();
+    let mut interface = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
+    let mut connections: std::collections::HashMap<Connection, ntcp::State> = Default::default();
     let mut buf = [0u8; 1234];
 
     loop {
@@ -37,7 +37,7 @@ fn main() -> std::io::Result<()> {
                             dest: (ip_hdr.destination_addr(), tcp_hdr.destination_port())
                         })
                         .or_default()
-                        .on_packet(ip_hdr, tcp_hdr, &buf[data_idx..n_bytes]);
+                        .on_packet(&mut interface, ip_hdr, tcp_hdr, &buf[data_idx..n_bytes]);
                     }
                     Err(e) => {
                         eprintln!("ntcp: invalid tcp packet, {:?}", e);
