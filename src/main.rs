@@ -8,7 +8,7 @@ struct Connection {
 
 fn main() -> std::io::Result<()> {
     let mut interface = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun)?;
-    let mut connections: std::collections::HashMap<Connection, ntcp::State> = Default::default();
+    let mut connections: std::collections::HashMap<Connection, ntcp::TCB> = Default::default();
     let mut buf = [0u8; 1234];
 
     loop {
@@ -30,14 +30,28 @@ fn main() -> std::io::Result<()> {
 
                 match etherparse::TcpHeaderSlice::from_slice(&buf[4 + ip_hdr.slice().len()..]) {
                     Ok(tcp_hdr) => {
+                        use std::collections::hash_map::Entry;
+                        
                         let data_idx = 4 + ip_hdr.slice().len() + tcp_hdr.slice().len();
-
-                        connections.entry(Connection {
+                        
+                        match connections.entry(Connection {
                             src: (ip_hdr.source_addr(), tcp_hdr.source_port()),
-                            dest: (ip_hdr.destination_addr(), tcp_hdr.destination_port())
-                        })
-                        .or_default()
-                        .on_packet(&mut interface, ip_hdr, tcp_hdr, &buf[data_idx..n_bytes]);
+                            dest: (ip_hdr.destination_addr(), tcp_hdr.destination_port()),
+                        }) {
+                            Entry::Occupied(mut c) => {
+                                c.get_mut().on_packet(&mut interface, ip_hdr, tcp_hdr, &buf[data_idx..n_bytes])?;
+                            },
+                            Entry::Vacant(mut e) => {
+                                if let Some(c) = ntcp::TCB::accept(
+                                    &mut interface,
+                                    ip_hdr,
+                                    tcp_hdr,
+                                    &buf[data_idx..n_bytes],
+                                )? {
+                                    e.insert(c);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("ntcp: invalid tcp packet, {:?}", e);
